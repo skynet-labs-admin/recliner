@@ -1,0 +1,27 @@
+## Build output
+bin/
+obj/
+
+## Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## Windows artifacts
+Thumbs.db
+desktop.ini
+*.lnk
+
+## Python
+__pycache__/
+*.pyc
+*.pyo
+
+## Release builds
+**/publish/
+
+## Local config overrides
+appsettings.*.json
+secrets.json
