@@ -154,6 +154,12 @@ public partial class SettingsWindow : Window
             OpenBrowserOnLaunch  = ChkOpenBrowser.IsChecked == true,
             Theme                = _selectedTheme
         };
+        // Create shared output folder if it doesn't exist yet
+        if (!string.IsNullOrWhiteSpace(Result.SharedOutputPath))
+            WslService.RunSilent(
+                $"mkdir -p \"{Result.SharedOutputPath}\"",
+                Result.WslDistro);
+
         DialogResult = true;
     }
 

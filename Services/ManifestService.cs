@@ -1,127 +1,60 @@
 using System.IO;
-using Newtonsoft.Json;
+using System.Text.RegularExpressions;
 
 namespace Recliner.Services;
 
 public static class ManifestService
 {
-    private const string ManifestFileName = "manifest.json";
+    // ── Public API ────────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Load all ComfyUI instances from the parent WSL path.
-    /// For each subdirectory, attempts to read manifest.json.
-    /// Falls back to directory-scan data if no manifest exists.
-    /// </summary>
     public static List<ComfyInstance> LoadInstances(AppSettings settings)
     {
         var instances = new List<ComfyInstance>();
         var dirs = WslService.ListSubdirectories(settings.WslParentPath, settings.WslDistro);
-
         foreach (var dirName in dirs)
         {
-            string wslDirPath = $"{settings.WslParentPath.TrimEnd('/')}/{dirName}";
-            string winPath = WslService.ToWindowsPath(wslDirPath, settings.WslDistro);
-
-            var instance = TryLoadManifest(wslDirPath, winPath, settings.WslDistro)
-                        ?? ScanDirectory(wslDirPath, winPath, settings.WslDistro);
-
-            instance.DirectoryName = dirName;
-            instance.WslPath = wslDirPath;
-            instance.WindowsPath = winPath;
-
-            instances.Add(instance);
+            string wslPath = $"{settings.WslParentPath.TrimEnd('/')}/{dirName}";
+            string winPath = WslService.ToWindowsPath(wslPath, settings.WslDistro);
+            instances.Add(ScanInstance(dirName, wslPath, winPath, settings));
+            // Silently remove pip temp artifacts (~* dirs in site-packages)
+            // Fire-and-forget — safe, idempotent, no user action required
+            WslService.RunSilent(
+                $"find \"{wslPath}/venv/lib\" -maxdepth 3 -type d -name '~*' " +
+                $"-exec rm -rf {{}} + 2>/dev/null; true",
+                settings.WslDistro);
         }
-
         return instances;
     }
 
-    /// <summary>
-    /// Updates only the port field in an existing manifest.json on disk.
-    /// Used for the inline port editor — avoids a full re-scan.
-    /// </summary>
-    public static void PatchPort(string windowsInstancePath, int port)
+    public static ComfyInstance ScanInstance(
+        string dirName, string wslPath, string winPath, AppSettings settings)
     {
-        string manifestPath = Path.Combine(windowsInstancePath, ManifestFileName);
-        try
+        var inst = new ComfyInstance
         {
-            if (!File.Exists(manifestPath)) return;
-            var obj = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(manifestPath));
-            obj["port"] = port;
-            File.WriteAllText(manifestPath,
-                obj.ToString(Newtonsoft.Json.Formatting.Indented));
-        }
-        catch { }
-    }
+            DirectoryName = dirName,
+            WslPath       = wslPath,
+            WindowsPath   = winPath,
+        };
 
-    /// <summary>
-    /// Updates only the extra_args field in an existing manifest.json on disk.
-    /// </summary>
-    public static void PatchExtraArgs(string windowsInstancePath, string args)
-    {
-        string manifestPath = Path.Combine(windowsInstancePath, ManifestFileName);
-        try
-        {
-            if (!File.Exists(manifestPath)) return;
-            var obj = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(manifestPath));
-            obj["extra_args"] = args;
-            File.WriteAllText(manifestPath,
-                obj.ToString(Newtonsoft.Json.Formatting.Indented));
-        }
-        catch { }
-    }
+        // Versions — read directly from venv and source files
+        inst.ComfyUIVersion     = ReadComfyVersion(winPath)          ?? "—";
+        string? torch           = ReadPackageVersion(winPath, "torch");
+        inst.PyTorchVersion     = torch != null ? StripBuildTag(torch) : "—";
+        inst.CudaBuild          = torch != null ? ExtractCudaTag(torch) : "—";
+        inst.TorchVisionVersion = StripBuildTag(ReadPackageVersion(winPath, "torchvision") ?? "—");
+        inst.TorchAudioVersion  = StripBuildTag(ReadPackageVersion(winPath, "torchaudio")  ?? "—");
 
-    /// <summary>
-    /// Reload a single instance from disk — used by the live watcher when
-    /// manifest.json changes. Public so MainWindow can call it directly.
-    /// </summary>
-    public static ComfyInstance ReloadSingle(
-        string dirName, string wslPath, string winPath, string distro)
-    {
-        var inst = TryLoadManifest(wslPath, winPath, distro)
-                ?? ScanDirectory(wslPath, winPath, distro);
-        inst.DirectoryName = dirName;
-        inst.WslPath       = wslPath;
-        inst.WindowsPath   = winPath;
-        return inst;
-    }
+        // Port and extra args — stored in user.yaml (ComfyUI's own config file)
+        inst.Port      = ReadPortFromUserYaml(winPath);
+        inst.ExtraArgs = ReadExtraArgsFromUserYaml(winPath);
 
-    /// <summary>
-    /// Load a single instance from its manifest.json if present.
-    /// </summary>
-    private static ComfyInstance? TryLoadManifest(string wslDirPath, string winPath, string distro)
-    {
-        string manifestWin = Path.Combine(winPath, ManifestFileName);
-        try
-        {
-            if (!File.Exists(manifestWin)) return null;
-            string json = File.ReadAllText(manifestWin);
-            var inst = JsonConvert.DeserializeObject<ComfyInstance>(json);
-            if (inst == null) return null;
-            inst.HasManifest = true;
+        // Output folder
+        inst.OutputFolder = !string.IsNullOrEmpty(settings.SharedOutputPath)
+            ? $"{settings.SharedOutputPath.TrimEnd('/')}/{dirName}"
+            : $"{wslPath}/output";
+        inst.OutputFileCount = WslService.CountOutputFiles(inst.OutputFolder, settings.WslDistro);
 
-            // If output_file_count was -1 in manifest, try to count live
-            if (inst.OutputFileCount < 0 && !string.IsNullOrEmpty(inst.OutputFolder))
-                inst.OutputFileCount = WslService.CountOutputFiles(inst.OutputFolder, distro);
-
-            return inst;
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    /// <summary>
-    /// Minimal data gathered by scanning the ComfyUI directory without a manifest.
-    /// </summary>
-    private static ComfyInstance ScanDirectory(string wslDirPath, string winPath, string distro)
-    {
-        var inst = new ComfyInstance { HasManifest = false };
-
-        // Try to read ComfyUI version from comfyui/__init__.py
-        inst.ComfyUIVersion = TryReadComfyVersion(winPath) ?? "unknown";
-
-        // Enumerate custom_nodes subdirectories
+        // Custom nodes — scan directory directly
         string customNodesWin = Path.Combine(winPath, "custom_nodes");
         if (Directory.Exists(customNodesWin))
         {
@@ -129,97 +62,124 @@ public static class ManifestService
             {
                 string nodeName = Path.GetFileName(nodeDir);
                 if (nodeName.StartsWith('.') || nodeName == "__pycache__") continue;
-
-                var node = new CustomNode
+                inst.CustomNodes.Add(new CustomNode
                 {
-                    Name = nodeName,
-                    Version = TryReadNodeVersion(nodeDir) ?? "unknown",
+                    Name    = nodeName,
+                    Version = ReadNodeVersion(nodeDir) ?? "unknown",
                     Enabled = !File.Exists(Path.Combine(nodeDir, ".disabled"))
-                };
-                inst.CustomNodes.Add(node);
+                });
             }
-        }
-
-        // Try to find output folder
-        string defaultOutput = Path.Combine(winPath, "output");
-        if (Directory.Exists(defaultOutput))
-        {
-            inst.OutputFolder = $"{wslDirPath}/output";
-            inst.OutputFileCount = WslService.CountOutputFiles(inst.OutputFolder, distro);
         }
 
         return inst;
     }
 
-    /// <summary>
-    /// Reads the ComfyUI version directly from the source files on disk —
-    /// the ground truth against which the manifest is validated.
-    /// Public so MainWindow can compare without loading a full instance.
-    /// </summary>
-    public static string? ReadComfyVersionFromSource(string winRootPath)
-        => TryReadComfyVersion(winRootPath);
+    // ── Port persistence (user.yaml) ──────────────────────────────────────────
 
-    /// <summary>
-    /// Reads the PyTorch version directly from the venv's installed package
-    /// metadata — torch/version.py inside site-packages.
-    /// Returns null if the venv doesn't exist or torch isn't installed.
-    /// </summary>
-    public static string? ReadTorchVersionFromSource(string winRootPath)
+    public static int ReadPortFromUserYaml(string winPath)
     {
-        string libPath = Path.Combine(winRootPath, "venv", "lib");
-        if (!Directory.Exists(libPath)) return null;
+        string yamlPath = Path.Combine(winPath, "user.yaml");
         try
         {
-            foreach (var pyDir in Directory.GetDirectories(libPath, "python*"))
-            {
-                string versionFile = Path.Combine(
-                    pyDir, "site-packages", "torch", "version.py");
-                if (!File.Exists(versionFile)) continue;
-                string text = File.ReadAllText(versionFile);
-                var m = System.Text.RegularExpressions.Regex.Match(
-                    text, @"__version__\s*=\s*[^\d]*(\d+\.\d[\d.+a-zA-Z]*)");
-                if (m.Success) return m.Groups[1].Value;
-            }
+            if (!File.Exists(yamlPath)) return 8188;
+            string content = File.ReadAllText(yamlPath);
+            var m = Regex.Match(content, @"^port\s*:\s*(\d+)", RegexOptions.Multiline);
+            return m.Success && int.TryParse(m.Groups[1].Value, out int p) ? p : 8188;
         }
-        catch { }
-        return null;
+        catch { return 8188; }
     }
 
-    private static string? TryReadComfyVersion(string winRootPath)
+    // ── ExtraArgs persistence (user.yaml recliner_extra_args field) ───────────
+
+    public static string ReadExtraArgsFromUserYaml(string winPath)
     {
-        // Check comfyui/__init__.py for __version__
+        string yamlPath = Path.Combine(winPath, "user.yaml");
+        try
+        {
+            if (!File.Exists(yamlPath)) return "";
+            string content = File.ReadAllText(yamlPath);
+            var m = Regex.Match(content,
+                @"^recliner_extra_args\s*:\s*(.+)$", RegexOptions.Multiline);
+            return m.Success ? m.Groups[1].Value.Trim().Trim('"', '\'') : "";
+        }
+        catch { return ""; }
+    }
+
+    public static void WriteExtraArgs(string winPath, string args)
+    {
+        string yamlPath = Path.Combine(winPath, "user.yaml");
+        try
+        {
+            string content = File.Exists(yamlPath) ? File.ReadAllText(yamlPath) : "";
+            var rx = new Regex(@"^recliner_extra_args\s*:.*$", RegexOptions.Multiline);
+            string newLine = $"recliner_extra_args: {args}";
+            content = rx.IsMatch(content)
+                ? rx.Replace(content, newLine)
+                : content.TrimEnd() + "\n" + newLine + "\n";
+            File.WriteAllText(yamlPath, content);
+        }
+        catch { }
+    }
+
+    // ── Version readers ───────────────────────────────────────────────────────
+
+    private static string? ReadComfyVersion(string winPath)
+    {
         string[] candidates =
         [
-            Path.Combine(winRootPath, "comfyui", "version.py"),   // comfy-org/ComfyUI (current)
-            Path.Combine(winRootPath, "comfyui", "__init__.py"),
-            Path.Combine(winRootPath, "comfyui_version.py"),
-            Path.Combine(winRootPath, "__init__.py"),
-            Path.Combine(winRootPath, "version.txt"),
+            Path.Combine(winPath, "comfyui", "version.py"),
+            Path.Combine(winPath, "comfyui", "__init__.py"),
+            Path.Combine(winPath, "comfyui_version.py"),
+            Path.Combine(winPath, "__init__.py"),
+            Path.Combine(winPath, "version.txt"),
         ];
-
-        foreach (var candidate in candidates)
+        foreach (var c in candidates)
         {
             try
             {
-                if (!File.Exists(candidate)) continue;
-                string content = File.ReadAllText(candidate);
-
-                // Look for __version__ = "x.y.z"
-                var match = System.Text.RegularExpressions.Regex.Match(
-                    content, @"__version__\s*=\s*[^\d]*(\d+\.\d[\d.]*)");
-                if (match.Success) return match.Groups[1].Value;
-
-                // Plain version.txt
-                if (candidate.EndsWith("version.txt")) return content.Trim();
+                if (!File.Exists(c)) continue;
+                string text = File.ReadAllText(c);
+                if (c.EndsWith("version.txt")) return text.Trim();
+                var m = Regex.Match(text,
+                    @"__version__\s*=\s*[^\d]*(\d+\.\d[\d.]*)");
+                if (m.Success) return m.Groups[1].Value;
             }
             catch { }
         }
         return null;
     }
 
-    private static string? TryReadNodeVersion(string nodeWinPath)
+    private static string? ReadPackageVersion(string winPath, string packageName)
     {
-        // Try pyproject.toml, setup.cfg, version.txt, __init__.py
+        // Check both venv and .venv — either can be used depending on how the instance was set up
+        string[] venvCandidates =
+        [
+            Path.Combine(winPath, "venv",  "lib"),
+            Path.Combine(winPath, ".venv", "lib"),
+        ];
+        foreach (var libPath in venvCandidates)
+        {
+            if (!Directory.Exists(libPath)) continue;
+            try
+            {
+                foreach (var pyDir in Directory.GetDirectories(libPath, "python*"))
+                {
+                    string versionFile = Path.Combine(
+                        pyDir, "site-packages", packageName, "version.py");
+                    if (!File.Exists(versionFile)) continue;
+                    string text = File.ReadAllText(versionFile);
+                    var m = Regex.Match(text,
+                        @"__version__\s*=\s*[^\d]*(\d+\.\d[\d.+a-zA-Z]*)");
+                    if (m.Success) return m.Groups[1].Value;
+                }
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    private static string? ReadNodeVersion(string nodeWinPath)
+    {
         string[] candidates =
         [
             Path.Combine(nodeWinPath, "pyproject.toml"),
@@ -227,19 +187,37 @@ public static class ManifestService
             Path.Combine(nodeWinPath, "version.txt"),
             Path.Combine(nodeWinPath, "__init__.py"),
         ];
-
         foreach (var c in candidates)
         {
             try
             {
                 if (!File.Exists(c)) continue;
                 string text = File.ReadAllText(c);
-                var m = System.Text.RegularExpressions.Regex.Match(
-                    text, @"version\s*[=:]\s*[^\d]*(\d+\.\d[\w.]*)");
+                var m = Regex.Match(text,
+                    @"version\s*[=:]\s*[^\d]*(\d+\.\d[\w.]*)");
                 if (m.Success) return m.Groups[1].Value;
             }
             catch { }
         }
         return null;
     }
+
+    private static string StripBuildTag(string version)
+    {
+        int plus = version.IndexOf('+');
+        return plus > 0 ? version[..plus] : version;
+    }
+
+    private static string ExtractCudaTag(string version)
+    {
+        var m = Regex.Match(version, @"\+(cu\d+)");
+        return m.Success ? m.Groups[1].Value : "—";
+    }
+
+    // Keep these public for backward compatibility with WslService.WritePortConfig
+    public static string? ReadComfyVersionFromSource(string winRootPath)
+        => ReadComfyVersion(winRootPath);
+
+    public static string? ReadTorchVersionFromSource(string winRootPath)
+        => ReadPackageVersion(winRootPath, "torch");
 }

@@ -116,11 +116,35 @@ public static class WslService
         string wslPath, string distro, int port,
         string? launchCommand, string defaultCommand,
         string? outputWslPath = null,
-        string? extraArgs = null)
+        string? extraArgs = null,
+        string? sharedModelsPath = null)
     {
         var sb = new StringBuilder();
         sb.AppendLine("#!/bin/bash");
         sb.AppendLine($"cd \"{wslPath}\"");
+
+        // Write a fresh extra_model_paths.yaml before every launch so the shared
+        // models path always reflects the current RECLINER Settings value.
+        // ComfyUI auto-detects this file in its own directory — no flag needed.
+        if (!string.IsNullOrWhiteSpace(sharedModelsPath))
+        {
+            string models = sharedModelsPath.TrimEnd('/');
+            sb.AppendLine($"cat > \"{wslPath}/extra_model_paths.yaml\" << 'RECLINER_YAML_EOF'");
+            sb.AppendLine("comfyui:");
+            sb.AppendLine($"    base_path: {models}/");
+            foreach (var dir in new[]{ "checkpoints","clip","clip_vision","configs",
+                "controlnet","diffusion_models","embeddings","gligen","hypernetworks",
+                "ipadapter","loras","photomaker","style_models","text_encoders",
+                "unet","upscale_models","vae","vae_approx" })
+                sb.AppendLine($"    {dir}: {dir}/");
+            sb.AppendLine("RECLINER_YAML_EOF");
+        }
+        else
+        {
+            // No shared models configured — remove any stale yaml so ComfyUI
+            // doesn't try to open a path that no longer exists.
+            sb.AppendLine($"rm -f \"{wslPath}/extra_model_paths.yaml\"");
+        }
 
         // start.sh written by RECLINER at setup time is the authoritative launcher.
         // Fall back to the stored / default command if it's somehow missing.
@@ -153,9 +177,14 @@ public static class WslService
     /// so Windows Terminal / cmd.exe cannot misparse it.
     /// </summary>
     public static void RunScript(string scriptContent, string distro, string tabTitle = "RECLINER")
-    {
-        RunInTerminal(distro, scriptContent, tabTitle);
-    }
+        => RunInTerminal(distro, scriptContent, tabTitle);
+
+    /// <summary>
+    /// Public overload — opens a terminal running an inline bash command string.
+    /// Used by the Open Terminal button to drop into an instance venv shell.
+    /// </summary>
+    public static void RunInTerminalPublic(string distro, string bashCommand, string title)
+        => RunInTerminal(distro, $"#!/bin/bash\n{bashCommand}", title);
 
     /// <summary>
     /// Converts a Windows absolute path to the WSL /mnt/ mount path.
@@ -204,6 +233,52 @@ public static class WslService
             File.WriteAllText(yamlPath, content);
         }
         catch { /* inaccessible — silently skip */ }
+    }
+
+    /// <summary>
+    /// Returns true if a ComfyUI process is running on the given port in WSL.
+    /// Uses pgrep to search for main.py with the matching --port argument.
+    /// </summary>
+    public static bool IsComfyRunning(string distro, int port)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo(
+                "wsl.exe", $"-d {distro} -- pgrep -f \"main.py.*--port {port}\"")
+            {
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var proc = Process.Start(psi);
+            if (proc == null) return false;
+            proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit(3000);
+            return proc.ExitCode == 0; // pgrep exits 0 when a match is found
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Sends SIGTERM to any ComfyUI process running on the given port in WSL.
+    /// pkill matches on the same pattern as IsComfyRunning.
+    /// </summary>
+    public static void StopComfyUI(string distro, int port)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo(
+                "wsl.exe", $"-d {distro} -- pkill -f \"main.py.*--port {port}\"")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            using var proc = Process.Start(psi);
+            proc?.WaitForExit(5000);
+        }
+        catch { }
     }
 
     /// <summary>

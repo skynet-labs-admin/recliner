@@ -15,15 +15,33 @@ public partial class MainWindow : Window
     private List<ComfyInstance> _instances = [];
     private ComfyInstance? _selected;
 
-    // ── Live manifest watcher ────────────────────────────────────────────────
-    // Polls every 2 seconds. When manifest.json changes on disk the detail
-    // panel updates automatically — no Refresh click needed.
+    // ── Live watcher ─────────────────────────────────────────────────────────
+    // Polls every 2 seconds for new/removed directories and process state.
     private DispatcherTimer? _watchTimer;
-    private readonly Dictionary<string, DateTime> _manifestTimes = new();
 
-    // Tracks which instances have had a silent manifest regen queued this session
-    // so we never fire more than once per instance per app launch.
-    private readonly HashSet<string> _regenQueued = new();
+    // ── Logo rotating taglines ───────────────────────────────────────────────
+    private static readonly string[] _taglines =
+    [
+        "Limit blast radius",
+        "Bringing peace where conflict once thrived",
+        "Not related to Steiner Recliner",
+        "ComfyUI runs finer with RECLINER",
+        "All comfy, no crash"
+    ];
+    private int _taglineIndex = 0;
+    private DispatcherTimer? _taglineTimer;
+
+    // ── Running process tracker ──────────────────────────────────────────────
+    // Keyed by port — pgrep/pkill use port as the discriminator.
+    // Populated on launch, cleared on stop or when watcher detects process exit.
+    private readonly HashSet<int> _runningPorts = new();
+    private int _watcherTickCount = 0;
+
+    // ── WSL UNC miss counter ─────────────────────────────────────────────────
+    // WSL's \\wsl$ share goes momentarily unreachable during heavy I/O or
+    // after wake-from-sleep. Don't evict instances on the first miss —
+    // require 3 consecutive failures before treating a folder as gone.
+    private readonly Dictionary<string, int> _missCounts = new();
 
     public MainWindow()
     {
@@ -31,7 +49,7 @@ public partial class MainWindow : Window
         _settings = SettingsService.Load();
         LoadWindowIcon();
         Loaded += MainWindow_Loaded;
-        Closed += (_, _) => _watchTimer?.Stop();
+        Closed += (_, _) => { _watchTimer?.Stop(); _taglineTimer?.Stop(); };
     }
 
     private void LoadWindowIcon()
@@ -51,6 +69,18 @@ public partial class MainWindow : Window
         UpdateStatusBar();
         LoadInstances();
         StartWatcher();
+        StartTaglineRotator();
+    }
+
+    private void StartTaglineRotator()
+    {
+        _taglineTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+        _taglineTimer.Tick += (_, _) =>
+        {
+            _taglineIndex = (_taglineIndex + 1) % _taglines.Length;
+            BdrLogo.ToolTip = _taglines[_taglineIndex];
+        };
+        _taglineTimer.Start();
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -82,15 +112,6 @@ public partial class MainWindow : Window
             ListInstances.ItemsSource = _instances;
             TxtCount.Text = _instances.Count.ToString();
 
-            // Seed watcher times so existing files don't trigger false reloads
-            SeedManifestTimes();
-
-            // Silently heal any instances whose manifest exists but has stale
-            // "unknown" runtime values — happens when an old/broken setup script
-            // wrote the manifest before torch was installed or due to a Python
-            // SyntaxError in an earlier version of generate_manifest.py.
-            AutoFixStaleManifests();
-
             // ── Step 3: specific, honest status ──────────────────────────────
             if (_instances.Count == 0)
             {
@@ -98,11 +119,7 @@ public partial class MainWindow : Window
             }
             else
             {
-                int ready  = _instances.Count(i => i.HasManifest);
-                int setup  = _instances.Count - ready;
                 string msg = $"{_instances.Count} instance{(_instances.Count != 1 ? "s" : "")} found";
-                if (ready > 0) msg += $"  ·  {ready} active";
-                if (setup > 0) msg += $"  ·  {setup} need{(setup == 1 ? "s" : "")} Setup Environment";
                 SetStatus(msg);
             }
         }
@@ -113,66 +130,6 @@ public partial class MainWindow : Window
 
         TxtPathDisplay.Text = _settings.WslParentPath;
         UpdateStatusBar();
-    }
-
-    private void SeedManifestTimes()
-    {
-        foreach (var inst in _instances)
-        {
-            string mf = Path.Combine(inst.WindowsPath, "manifest.json");
-            try
-            {
-                if (File.Exists(mf))
-                    _manifestTimes[inst.DirectoryName] = File.GetLastWriteTimeUtc(mf);
-            }
-            catch { /* inaccessible — skip */ }
-        }
-    }
-
-    /// <summary>
-    /// Compares each manifest against the actual source files on disk.
-    /// If anything diverges — for any reason, including manual edits —
-    /// the manifest is silently regenerated. One invariant, no special cases.
-    /// </summary>
-    private void AutoFixStaleManifests()
-    {
-        foreach (var inst in _instances)
-        {
-            if (!inst.HasManifest) continue;
-            if (_regenQueued.Contains(inst.DirectoryName)) continue;
-
-            // Read ComfyUI version straight from the source file.
-            // If it's null, ComfyUI isn't installed here — skip.
-            string? sourceVersion = ManifestService.ReadComfyVersionFromSource(
-                inst.WindowsPath);
-            if (sourceVersion == null) continue;
-
-            // Read torch version from venv site-packages (null = not installed).
-            string? sourceTorch = ManifestService.ReadTorchVersionFromSource(
-                inst.WindowsPath);
-
-            // Strip build tag for comparison — manifest stores "2.6.0" display
-            // value but source has "2.6.0+cu124".
-            string sourceTorchBase = sourceTorch ?? "unknown";
-            int plus = sourceTorchBase.IndexOf('+');
-            if (plus > 0) sourceTorchBase = sourceTorchBase[..plus];
-
-            bool comfyMismatch  = sourceVersion != inst.ComfyUIVersion;
-            bool torchMismatch  = sourceTorch != null &&
-                                  sourceTorchBase != inst.PyTorchVersion &&
-                                  inst.PyTorchVersion == "unknown";
-
-            if (!comfyMismatch && !torchMismatch) continue;
-
-            _regenQueued.Add(inst.DirectoryName);
-
-            string outPath = !string.IsNullOrEmpty(inst.OutputFolder)
-                ? inst.OutputFolder
-                : $"{inst.WslPath}/output";
-
-            string script = ScriptBuilder.RegenerateManifest(inst.WslPath, outPath);
-            WslService.RunSilent(script, _settings.WslDistro);
-        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -189,13 +146,34 @@ public partial class MainWindow : Window
 
     private void WatcherTick(object? sender, EventArgs e)
     {
+        // ── Phase 0: check if any running ComfyUI processes have died ─────────
+        _watcherTickCount++;
+        if (_watcherTickCount % 5 == 0 && _runningPorts.Count > 0)
+            CheckRunningProcesses();
+
         // ── Phase 1: detect deleted instance directories ──────────────────────
-        var gone = _instances.Where(i => !Directory.Exists(i.WindowsPath)).ToList();
-        foreach (var dead in gone)
+        // Require 3 consecutive misses before evicting — the \\wsl$ share can
+        // go transiently unreachable during heavy I/O or wake-from-sleep.
+        const int EvictThreshold = 3;
+        var confirmed = new List<ComfyInstance>();
+        foreach (var inst in _instances)
+        {
+            if (!Directory.Exists(inst.WindowsPath))
+            {
+                _missCounts.TryGetValue(inst.DirectoryName, out int misses);
+                _missCounts[inst.DirectoryName] = misses + 1;
+                if (misses + 1 >= EvictThreshold)
+                    confirmed.Add(inst);
+            }
+            else
+            {
+                _missCounts.Remove(inst.DirectoryName); // reset on successful check
+            }
+        }
+        foreach (var dead in confirmed)
         {
             _instances.Remove(dead);
-            _manifestTimes.Remove(dead.DirectoryName);
-            _regenQueued.Remove(dead.DirectoryName);
+            _missCounts.Remove(dead.DirectoryName);
 
             if (_selected?.DirectoryName == dead.DirectoryName)
             {
@@ -204,12 +182,12 @@ public partial class MainWindow : Window
                 PanelEmpty.Visibility  = Visibility.Visible;
             }
         }
-        if (gone.Any())
+        if (confirmed.Any())
         {
             ListInstances.ItemsSource = null;
             ListInstances.ItemsSource = _instances;
             TxtCount.Text = _instances.Count.ToString();
-            SetStatus($"↻  {gone[0].DirectoryName} — removed");
+            SetStatus($"↻  {confirmed[0].DirectoryName} — removed");
         }
 
         // ── Phase 2: detect new subdirectories in the parent folder ───────────
@@ -248,52 +226,6 @@ public partial class MainWindow : Window
         }
         catch { /* UNC not reachable — skip */ }
 
-        // ── Phase 3: detect manifest changes in existing instances ────────────
-        foreach (var inst in _instances.ToList())
-        {
-            string mf = Path.Combine(inst.WindowsPath, "manifest.json");
-            DateTime newTime;
-            try
-            {
-                if (!File.Exists(mf)) continue;
-                newTime = File.GetLastWriteTimeUtc(mf);
-            }
-            catch { continue; }
-
-            if (!_manifestTimes.TryGetValue(inst.DirectoryName, out var prevTime))
-            {
-                _manifestTimes[inst.DirectoryName] = newTime;
-                continue;
-            }
-
-            if (newTime <= prevTime) continue;
-
-            _manifestTimes[inst.DirectoryName] = newTime;
-            AutoReloadInstance(inst);
-        }
-    }
-
-    private void AutoReloadInstance(ComfyInstance stale)
-    {
-        var fresh = ManifestService.ReloadSingle(
-            stale.DirectoryName, stale.WslPath, stale.WindowsPath, _settings.WslDistro);
-
-        int idx = _instances.IndexOf(stale);
-        if (idx >= 0)
-            _instances[idx] = fresh;
-
-        // Refresh the sidebar list binding
-        ListInstances.Items.Refresh();
-        TxtCount.Text = _instances.Count.ToString();
-
-        // If this is the currently displayed instance, update the detail panel live
-        if (_selected?.DirectoryName == stale.DirectoryName)
-        {
-            _selected = fresh;
-            ShowInstance(fresh);
-        }
-
-        SetStatus($"↻  {fresh.DirectoryName} — manifest updated");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -316,29 +248,6 @@ public partial class MainWindow : Window
 
         // ── Header ──────────────────────────────────────────────────────────
         TxtInstanceName.Text = inst.DirectoryName;
-
-        if (inst.HasManifest)
-        {
-            BadgeHasManifest.Background = new SolidColorBrush(Color.FromRgb(0x1a, 0x40, 0x30));
-            BadgeHasManifest.BorderBrush = new SolidColorBrush(Color.FromRgb(0x2a, 0x60, 0x45));
-            TxtManifestBadge.Text = "✓ manifest.json";
-            TxtManifestBadge.Foreground = new SolidColorBrush(Color.FromRgb(0x4e, 0xc9, 0xb0));
-        }
-        else
-        {
-            BadgeHasManifest.Background = new SolidColorBrush(Color.FromRgb(0x40, 0x30, 0x10));
-            BadgeHasManifest.BorderBrush = new SolidColorBrush(Color.FromRgb(0x60, 0x48, 0x18));
-            // Show the exact path RECLINER is looking at — no guessing
-            string expectedManifest = Path.Combine(inst.WindowsPath, "manifest.json");
-            bool pathReachable = Directory.Exists(inst.WindowsPath);
-            TxtManifestBadge.Text = pathReachable
-                ? $"⚠ No manifest.json at {inst.WindowsPath} — run Setup Environment"
-                : $"⚠ Folder unreachable: {inst.WindowsPath} — check Settings";
-            TxtManifestBadge.Foreground = new SolidColorBrush(Color.FromRgb(0xdc, 0xc6, 0x8a));
-        }
-
-        TxtGeneratedAt.Text = string.IsNullOrEmpty(inst.GeneratedAt)
-            ? "" : $"Generated {FormatDate(inst.GeneratedAt)}";
 
         // ── Runtime ─────────────────────────────────────────────────────────
         TxtComfyVersion.Text = inst.ComfyUIVersion;
@@ -388,6 +297,21 @@ public partial class MainWindow : Window
             PanelFailed.Visibility = Visibility.Collapsed;
         }
 
+        // Set button state from cached running set immediately, then confirm async
+        UpdateLaunchButton(inst);
+        int checkPort = inst.Port;
+        Task.Run(() => WslService.IsComfyRunning(_settings.WslDistro, checkPort))
+            .ContinueWith(t =>
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    if (t.Result) _runningPorts.Add(checkPort);
+                    else          _runningPorts.Remove(checkPort);
+                    if (_selected?.Port == checkPort)
+                        UpdateLaunchButton(_selected);
+                });
+            });
+
         SetStatus($"Showing: {inst.DirectoryName}");
     }
 
@@ -429,9 +353,6 @@ public partial class MainWindow : Window
         // Persist to user.yaml (ComfyUI reads this on launch)
         WslService.WritePortConfig(_selected.WindowsPath, port);
 
-        // Update manifest.json — the watcher will auto-refresh the panel
-        ManifestService.PatchPort(_selected.WindowsPath, port);
-
         // Refresh sidebar subtitle immediately
         ListInstances.Items.Refresh();
         SetStatus($"Port set to {port} for {_selected.DirectoryName}");
@@ -466,7 +387,7 @@ public partial class MainWindow : Window
         if (args == _selected.ExtraArgs) return;
 
         _selected.ExtraArgs = args;
-        ManifestService.PatchExtraArgs(_selected.WindowsPath, args);
+        ManifestService.WriteExtraArgs(_selected.WindowsPath, args);
         SetStatus(args.Length > 0
             ? $"Startup args saved for {_selected.DirectoryName}"
             : $"Startup args cleared for {_selected.DirectoryName}");
@@ -503,6 +424,19 @@ public partial class MainWindow : Window
     private void BtnLaunch_Click(object sender, RoutedEventArgs e)
     {
         if (_selected == null) return;
+
+        // ── STOP ─────────────────────────────────────────────────────────────
+        if (_runningPorts.Contains(_selected.Port))
+        {
+            int stopPort = _selected.Port;
+            WslService.StopComfyUI(_settings.WslDistro, stopPort);
+            _runningPorts.Remove(stopPort);
+            UpdateLaunchButton(_selected);
+            SetStatus($"Stopped {_selected.DirectoryName} on port {stopPort}");
+            return;
+        }
+
+        // ── LAUNCH ───────────────────────────────────────────────────────────
         try
         {
             string outputWslPath = string.IsNullOrEmpty(_settings.SharedOutputPath)
@@ -516,16 +450,34 @@ public partial class MainWindow : Window
                 _selected.LaunchCommand,
                 _settings.DefaultLaunchCommand,
                 outputWslPath,
-                _selected.ExtraArgs);
+                _selected.ExtraArgs,
+                _settings.SharedModelsPath);
 
+            _runningPorts.Add(_selected.Port);
+            UpdateLaunchButton(_selected);
             SetStatus($"Launched {_selected.DirectoryName} on port {_selected.Port}");
 
             if (_settings.OpenBrowserOnLaunch)
             {
                 int port = _selected.Port;
-                Task.Delay(3000).ContinueWith(_ =>
+                Task.Run(async () =>
+                {
+                    using var http = new System.Net.Http.HttpClient();
+                    http.Timeout = TimeSpan.FromSeconds(2);
+                    var deadline = DateTime.UtcNow.AddSeconds(120);
+                    while (DateTime.UtcNow < deadline)
+                    {
+                        try
+                        {
+                            var resp = await http.GetAsync($"http://localhost:{port}");
+                            if (resp.IsSuccessStatusCode) break;
+                        }
+                        catch { }
+                        await Task.Delay(2000);
+                    }
                     Process.Start(new ProcessStartInfo(
-                        $"http://localhost:{port}") { UseShellExecute = true }));
+                        $"http://localhost:{port}") { UseShellExecute = true });
+                });
             }
         }
         catch (Exception ex)
@@ -572,6 +524,18 @@ public partial class MainWindow : Window
             SetStatus($"Clone launched for '{dlg.CreatedInstanceName}' — panel will auto-update on completion.");
     }
 
+    private void BtnOpenTerminal_Click(object sender, RoutedEventArgs e)
+    {
+        if (_selected == null) return;
+        string wslPath = _selected.WslPath;
+        string script  =
+            $"cd \"{wslPath}\" && " +
+            $"bash --init-file <(echo '. ~/.bashrc; source \"{wslPath}/venv/bin/activate\"')";
+        WslService.RunInTerminalPublic(
+            _settings.WslDistro, script,
+            $"RECLINER — {_selected.DirectoryName}");
+    }
+
     private void BtnDeleteInstance_Click(object sender, RoutedEventArgs e)
     {
         if (_selected == null) return;
@@ -600,6 +564,41 @@ public partial class MainWindow : Window
     // ─────────────────────────────────────────────────────────────────────────
     //  Helpers
     // ─────────────────────────────────────────────────────────────────────────
+
+    // ── Launch / Stop button state ────────────────────────────────────────────
+
+    private void UpdateLaunchButton(ComfyInstance inst)
+    {
+        bool running = _runningPorts.Contains(inst.Port);
+        BtnLaunch.Content = running ? "■  Stop ComfyUI" : "▶  Launch ComfyUI";
+        BtnLaunch.Style   = running
+            ? (Style)FindResource("StopBtn")
+            : (Style)FindResource("LaunchBtn");
+    }
+
+    /// <summary>
+    /// Async check: for each tracked running port, confirm the process is still
+    /// alive in WSL. Called every 5 watcher ticks (~10 seconds).
+    /// </summary>
+    private void CheckRunningProcesses()
+    {
+        foreach (int port in _runningPorts.ToList())
+        {
+            int capturedPort = port;
+            Task.Run(() => WslService.IsComfyRunning(_settings.WslDistro, capturedPort))
+                .ContinueWith(t =>
+                {
+                    if (t.Result) return; // still alive — nothing to do
+                    Dispatcher.Invoke(() =>
+                    {
+                        _runningPorts.Remove(capturedPort);
+                        if (_selected?.Port == capturedPort)
+                            UpdateLaunchButton(_selected);
+                        SetStatus($"ComfyUI on port {capturedPort} has stopped");
+                    });
+                });
+        }
+    }
 
     private void SetStatus(string msg) => TxtStatus.Text = msg;
 
