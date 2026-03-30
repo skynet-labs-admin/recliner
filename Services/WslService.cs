@@ -121,6 +121,8 @@ public static class WslService
     {
         var sb = new StringBuilder();
         sb.AppendLine("#!/bin/bash");
+        // Store this bash session's PID so StopComfyUI can close the terminal window
+        sb.AppendLine($"echo $BASHPID > /tmp/recliner_{port}.pid");
         sb.AppendLine($"cd \"{wslPath}\"");
 
         // Write a fresh extra_model_paths.yaml before every launch so the shared
@@ -168,7 +170,40 @@ public static class WslService
         sb.AppendLine($"    \"$RECLINER_PY\" {fallbackEntry} {args}");
         sb.AppendLine( "fi");
 
-        return RunInTerminal(distro, sb.ToString(), $"ComfyUI :{port}");
+        // Use a plain cmd /c window — NOT Windows Terminal.
+        // cmd /c closes the window the moment bash exits (stop or crash).
+        // WT shows a "press Enter to restart" prompt which is confusing and wrong.
+        return RunInCmdWindow(distro, sb.ToString(), $"ComfyUI :{port}");
+    }
+
+    /// <summary>
+    /// Opens a plain cmd.exe /c window that closes automatically when the
+    /// bash script exits — used for ComfyUI instances so Stop closes the window.
+    /// </summary>
+    private static Process? RunInCmdWindow(string distro, string scriptContent, string title)
+    {
+        string tempWin = Path.Combine(
+            Path.GetTempPath(), $"recliner_{Guid.NewGuid():N}.sh");
+
+        File.WriteAllText(tempWin,
+            scriptContent.Replace("\r\n", "\n"),
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+
+        string wslScript = WinPathToWslMount(tempWin);
+        string safeTitle = title.Replace("\"", "").Replace("&", "");
+
+        // title command sets the window title; /c closes when done (no restart prompt)
+        string cmdArgs = $"/c \"title {safeTitle} & wsl.exe -d {distro} -- bash '{wslScript}'\"";
+
+        try
+        {
+            var psi = new ProcessStartInfo("cmd.exe", cmdArgs)
+            {
+                UseShellExecute = true
+            };
+            return Process.Start(psi);
+        }
+        catch { return null; }
     }
 
     /// <summary>
@@ -177,7 +212,7 @@ public static class WslService
     /// so Windows Terminal / cmd.exe cannot misparse it.
     /// </summary>
     public static void RunScript(string scriptContent, string distro, string tabTitle = "RECLINER")
-        => RunInTerminal(distro, scriptContent, tabTitle);
+        => RunInCmdWindow(distro, scriptContent, tabTitle);
 
     /// <summary>
     /// Public overload — opens a terminal running an inline bash command string.
@@ -265,20 +300,13 @@ public static class WslService
     /// </summary>
     public static void StopComfyUI(string distro, int port)
     {
-        try
-        {
-            var psi = new ProcessStartInfo(
-                "wsl.exe", $"-d {distro} -- pkill -f \"main.py.*--port {port}\"")
-            {
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-            using var proc = Process.Start(psi);
-            proc?.WaitForExit(5000);
-        }
-        catch { }
+        // Kill ComfyUI process then close the terminal window by killing the
+        // bash session whose PID was written to a temp file at launch time.
+        RunSilent($"pkill -f \"main.py.*--port {port}\" 2>/dev/null; " +
+                  $"bash_pid=$(cat /tmp/recliner_{port}.pid 2>/dev/null); " +
+                  $"[ -n \"$bash_pid\" ] && kill \"$bash_pid\" 2>/dev/null; " +
+                  $"rm -f /tmp/recliner_{port}.pid",
+                  distro);
     }
 
     /// <summary>
