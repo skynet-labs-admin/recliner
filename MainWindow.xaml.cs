@@ -35,6 +35,9 @@ public partial class MainWindow : Window
     // Keyed by port — pgrep/pkill use port as the discriminator.
     // Populated on launch, cleared on stop or when watcher detects process exit.
     private readonly HashSet<int> _runningPorts = new();
+    // Terminal window process per instance — keyed by DirectoryName, not port,
+    // so two instances that share a port don't clobber each other's entry.
+    private readonly Dictionary<string, Process> _launchProcesses = new();
     private int _watcherTickCount = 0;
 
     // ── WSL UNC miss counter ─────────────────────────────────────────────────
@@ -431,6 +434,12 @@ public partial class MainWindow : Window
             int stopPort = _selected.Port;
             WslService.StopComfyUI(_settings.WslDistro, stopPort);
             _runningPorts.Remove(stopPort);
+            // Close the terminal window that was opened for this instance
+            if (_launchProcesses.TryGetValue(_selected.DirectoryName, out var termProc))
+            {
+                try { termProc.Kill(); } catch { }
+                _launchProcesses.Remove(_selected.DirectoryName);
+            }
             UpdateLaunchButton(_selected);
             SetStatus($"Stopped {_selected.DirectoryName} on port {stopPort}");
             return;
@@ -443,7 +452,7 @@ public partial class MainWindow : Window
                 ? null!
                 : $"{_settings.SharedOutputPath.TrimEnd('/')}/{_selected.DirectoryName}";
 
-            WslService.LaunchComfyUI(
+            var termProc = WslService.LaunchComfyUI(
                 _selected.WslPath,
                 _settings.WslDistro,
                 _selected.Port,
@@ -453,6 +462,8 @@ public partial class MainWindow : Window
                 _selected.ExtraArgs,
                 _settings.SharedModelsPath);
 
+            if (termProc != null)
+                _launchProcesses[_selected.DirectoryName] = termProc;
             _runningPorts.Add(_selected.Port);
             UpdateLaunchButton(_selected);
             SetStatus($"Launched {_selected.DirectoryName} on port {_selected.Port}");

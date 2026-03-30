@@ -112,7 +112,7 @@ public static class WslService
     /// RECLINER only passes --port (and optionally --output-directory); everything
     /// else — venv resolution, activation, entry point — lives in start.sh.
     /// </summary>
-    public static void LaunchComfyUI(
+    public static Process? LaunchComfyUI(
         string wslPath, string distro, int port,
         string? launchCommand, string defaultCommand,
         string? outputWslPath = null,
@@ -168,7 +168,7 @@ public static class WslService
         sb.AppendLine($"    \"$RECLINER_PY\" {fallbackEntry} {args}");
         sb.AppendLine( "fi");
 
-        RunInTerminal(distro, sb.ToString(), $"ComfyUI :{port}");
+        return RunInTerminal(distro, sb.ToString(), $"ComfyUI :{port}");
     }
 
     /// <summary>
@@ -313,7 +313,7 @@ public static class WslService
     /// — a simple path with no shell operators that cannot be misinterpreted
     /// by Windows Terminal's command parser or cmd.exe.
     /// </summary>
-    private static void RunInTerminal(string distro, string scriptContent, string title)
+    private static Process? RunInTerminal(string distro, string scriptContent, string title)
     {
         // Write Unix-line-ending, BOM-free temp script
         string tempWin = Path.Combine(
@@ -325,43 +325,37 @@ public static class WslService
 
         string wslScript = WinPathToWslMount(tempWin);   // /mnt/c/Users/.../recliner_xxx.sh
 
-        bool launched = TryWindowsTerminal(distro, wslScript, title);
-        if (!launched)
-            FallbackConsole(distro, wslScript);
+        return TryWindowsTerminal(distro, wslScript, title)
+            ?? FallbackConsole(distro, wslScript);
     }
 
     /// <summary>
     /// Try Windows Terminal first (preferred — supports named tabs).
+    /// --window new forces a fresh WT window so we get back a real Process
+    /// that RECLINER can Kill() when the user clicks Stop.
     /// Argument to wt.exe is deliberately simple: just a file path in quotes.
     /// Windows Terminal uses `;` as a command separator so we must NEVER embed
     /// raw bash (which contains `;`, `&&`, `$var`) directly in wt.exe args.
     /// </summary>
-    private static bool TryWindowsTerminal(string distro, string wslScriptPath, string title)
+    private static Process? TryWindowsTerminal(string distro, string wslScriptPath, string title)
     {
         try
         {
-            // Sanitize title — no quotes
             string safeTitle = title.Replace("\"", "");
 
-            // The bash argument is a file path only.  Paths from GetTempPath()
-            // may contain spaces (username with spaces) so we quote the path.
-            // Single-quote inside a double-quoted wt arg is safe; the path
-            // itself cannot contain single-quotes (GUID hex + system dirs).
-            // Scripts end with `exec bash` so the process never exits and WT
-            // never shows its "press Enter to restart" prompt.
-            string wtArgs = $"new-tab --title \"{safeTitle}\" " +
+            // --window new → dedicated WT window per launch so we can kill it later
+            string wtArgs = $"--window new new-tab --title \"{safeTitle}\" " +
                             $"wsl.exe -d {distro} -- bash '{wslScriptPath}'";
 
             var psi = new ProcessStartInfo("wt.exe", wtArgs)
             {
-                UseShellExecute = true
+                UseShellExecute = false  // false → we get back a real Process handle
             };
-            Process.Start(psi);
-            return true;
+            return Process.Start(psi);
         }
         catch
         {
-            return false;
+            return null;
         }
     }
 
@@ -369,7 +363,7 @@ public static class WslService
     /// Fallback: open a cmd.exe window running wsl.exe directly.
     /// Again the argument to cmd is a plain script path — no bash operators.
     /// </summary>
-    private static void FallbackConsole(string distro, string wslScriptPath)
+    private static Process? FallbackConsole(string distro, string wslScriptPath)
     {
         try
         {
@@ -379,7 +373,7 @@ public static class WslService
             {
                 UseShellExecute = true
             };
-            Process.Start(psi);
+            return Process.Start(psi);
         }
         catch (Exception ex)
         {
@@ -389,6 +383,7 @@ public static class WslService
                 "RECLINER — Launch Error",
                 System.Windows.MessageBoxButton.OK,
                 System.Windows.MessageBoxImage.Error);
+            return null;
         }
     }
 }
